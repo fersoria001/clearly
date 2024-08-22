@@ -1,0 +1,22 @@
+{
+  "objects": [
+    {
+      "name": "DomainAggregate",
+      "type": "aggregate",
+      "table": "aggregate",
+      "fields": [
+        {
+          "name": "id",
+          "column": "id"
+        },
+        {
+          "name": "name",
+          "column": "name"
+        }
+      ],
+      "pkg": "example",
+      "dir": "/example",
+      "builder": "NewDomainAggregate"
+    }
+  ]
+}
