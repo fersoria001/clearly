@@ -7,11 +7,13 @@
       "fields": [
         {
           "name": "id",
-          "column": "id"
+          "column": "id",
+          "update": false
         },
         {
           "name": "name",
-          "column": "name"
+          "column": "name",
+          "update": true
         }
       ],
       "pkg": "example",

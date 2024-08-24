@@ -66,6 +66,7 @@ func ParseDomainObjectType(v string) (DomainObjectType, error) {
 type FieldType struct {
 	Name   string `json:"name"`
 	Column string `json:"column"`
+	Update bool   `json:"update"`
 }
 
 type ObjectType struct {
@@ -209,10 +210,11 @@ func pkgFiles(dir string, targetPkg string) (*types.Package, []*ast.File, *types
 }
 
 type ValidatedField struct {
-	name       string
-	dataType   string
-	haveGetter bool
-	getterName string
+	name       *string
+	dataType   *string
+	getterName *string
+	update     bool
+	setterName *string
 }
 
 // Check for nil fields in the object type, all fields with the exception of ValidatedFields are required.
@@ -265,51 +267,45 @@ func (o *ObjectType) valid(caller string) error {
 
 	expectedFields := make(map[string]*ValidatedField, 0)
 	for _, v := range o.Fields {
-		expectedFields[v.Name] = &ValidatedField{haveGetter: false}
+		expectedFields[v.Name] = &ValidatedField{update: v.Update}
 	}
+
 	if ctype, ok := obj.Type().Underlying().(*types.Struct); ok {
 		for i := range ctype.NumFields() {
 			v := ctype.Field(i)
 			if efield, ok := expectedFields[v.Name()]; ok {
-				efield.name = v.Name()
-				efield.dataType = v.Type().String()
+				name := v.Name()
+				dataType := v.Type().String()
+				efield.name = &name
+				efield.dataType = &dataType
 			}
 		}
 	}
+
 	mset := types.NewMethodSet(obj.Type())
 	checkReturn := func(tuple *types.Tuple, expected *ValidatedField) bool {
 		if tuple.Len() != 1 {
 			return false
 		}
 		rType := tuple.At(0).Type()
-		return rType.String() == expected.dataType
+		return rType.String() == *expected.dataType
 	}
+
 	for i := range mset.Len() {
 		meth := mset.At(i).Obj()
-		if efield, ok := expectedFields[strings.ToLower(meth.Name())]; ok && meth.Exported() {
+		methName := meth.Name()
+		if efield, ok := expectedFields[strings.ToLower(methName)]; ok && meth.Exported() {
 			if sig, ok := meth.Type().(*types.Signature); ok {
-				efield.haveGetter = checkReturn(sig.Results(), efield)
-				efield.getterName = meth.Name()
+				if checkReturn(sig.Results(), efield) {
+					efield.getterName = &methName
+				}
 			}
 		}
 	}
-	err = nil
-	for k, v := range expectedFields {
-		if !v.haveGetter {
-			if err != nil {
-				err = fmt.Errorf("%w\nthe field %s from type %s does not have a getter method of type func () %s",
-					err, k, o.Name, v.dataType)
-			} else {
-				err = fmt.Errorf("\nthe field %s from type %s does not have a getter method of type func () %s",
-					k, o.Name, v.dataType)
-			}
-		}
-	}
-	if err != nil {
-		return err
-	}
+
 	expectedParams := slices.Collect(maps.Values(expectedFields))
-	checkSig := func(sig *types.Signature) bool {
+
+	checkBuilderSig := func(sig *types.Signature) bool {
 		params := sig.Params()
 		if params.Len() != len(o.Fields) {
 			return false
@@ -317,7 +313,7 @@ func (o *ObjectType) valid(caller string) error {
 		for i := range params.Len() {
 			param := params.At(i)
 			expectedParam := expectedParams[i]
-			if param.Type().String() != expectedParam.dataType {
+			if param.Type().String() != *expectedParam.dataType {
 				return false
 			}
 		}
@@ -330,22 +326,93 @@ func (o *ObjectType) valid(caller string) error {
 		}
 		return true
 	}
+
+	checkSetterSig := func(sig *types.Signature, efield *ValidatedField) bool {
+		if sig.Results().Len() > 0 {
+			return false
+		}
+		if sig.Params().Len() != 1 {
+			return false
+		}
+		param := sig.Params().At(0)
+		return param.Type().String() == *efield.dataType
+	}
+
 	isCorrect := false
 	for _, file := range files {
 		ast.Inspect(file, func(n ast.Node) bool {
 			switch n := n.(type) {
 			case *ast.FuncDecl:
 				if n.Name.Name == o.Builder {
-					isCorrect = checkSig(info.Defs[n.Name].Type().(*types.Signature))
+					isCorrect = checkBuilderSig(info.Defs[n.Name].Type().(*types.Signature))
+				}
+				if sig, ok := info.Defs[n.Name].Type().(*types.Signature); ok &&
+					n.Name.IsExported() && n.Recv != nil && len(n.Recv.List) == 1 {
+					recv, ok := n.Recv.List[0].Type.(*ast.StarExpr)
+					if ok {
+						if forStruct, ok := recv.X.(*ast.Ident); ok && forStruct.Name == o.Name {
+							fieldName := strings.ToLower(n.Name.Name[3:])
+							if field, ok := expectedFields[fieldName]; ok &&
+								checkSetterSig(sig, field) {
+								field.setterName = &n.Name.Name
+							}
+						}
+					}
 				}
 			}
 			return true
 		})
 	}
+
+	err = nil
+	for k, v := range expectedFields {
+		if v.getterName == nil {
+			if err != nil {
+				err = fmt.Errorf("%w\nthe field %s from type %s does not have a getter method of type func () %s",
+					err, k, o.Name, *v.dataType)
+			} else {
+				err = fmt.Errorf("\nthe field %s from type %s does not have a getter method of type func () %s",
+					k, o.Name, *v.dataType)
+			}
+		}
+		if v.name == nil {
+			if err != nil {
+				err = fmt.Errorf("%w\nthe field %s is not present in type %s",
+					err, k, o.Name)
+			} else {
+				err = fmt.Errorf("\nthe field %s is not present in type %s",
+					k, o.Name)
+			}
+		}
+		if v.dataType == nil {
+			if err != nil {
+				err = fmt.Errorf("%w\ncould not get the data type for the field %s of type %s",
+					err, k, o.Name)
+			} else {
+				err = fmt.Errorf("\ncould not get the data type for the field %s of type %s",
+					k, o.Name)
+			}
+		}
+		if v.update && v.setterName == nil {
+			if err != nil {
+				err = fmt.Errorf("%w\nthe field %s has an update flag, a public set method for type %s is required",
+					err, k, o.Name)
+			} else {
+				err = fmt.Errorf("\nthe field %s has an update flag, a public set method for type %s is required",
+					k, o.Name)
+			}
+		}
+	}
+
+	if err != nil {
+		return err
+	}
+
 	if !isCorrect {
 		return fmt.Errorf("the builder method %s for type %s found in package %s has an incorrect signature",
 			o.Builder, o.Name, o.Pkg)
 	}
+
 	o.ValidatedFields = expectedParams
 	return nil
 }
@@ -464,7 +531,7 @@ func (g *DataMapperGenerator) insertStmt(o ObjectType) string {
 func (g *DataMapperGenerator) updateStmt(o ObjectType) string {
 	columns := make([]string, 0, len(o.Fields))
 	for i := range o.Fields {
-		if o.Fields[i].Column != "id" {
+		if o.Fields[i].Update {
 			columns = append(columns,
 				fmt.Sprintf("%s = $%d", o.Fields[i].Column, i+1),
 			)
@@ -497,7 +564,7 @@ func (g *DataMapperGenerator) generateNewPkg(pkgName string) string {
 func (g *DataMapperGenerator) generateDataMapperStructType(o ObjectType) {
 	index := -1
 	for i := range o.ValidatedFields {
-		if o.ValidatedFields[i].name == "id" {
+		if *o.ValidatedFields[i].name == "id" {
 			index = i
 		}
 	}
@@ -507,7 +574,7 @@ func (g *DataMapperGenerator) generateDataMapperStructType(o ObjectType) {
 	idField := o.ValidatedFields[index]
 	g.wln(fmt.Sprintf("type %sDataMapper struct {", o.Name))
 	g.wln(fmt.Sprintf("%s.PostgreSQLDataMapper[%s.DomainObject[%s],%s]",
-		dataMapperPkg, dataMapperPkg, idField.dataType, idField.dataType,
+		dataMapperPkg, dataMapperPkg, *idField.dataType, *idField.dataType,
 	))
 	g.wln("}")
 }
@@ -515,7 +582,7 @@ func (g *DataMapperGenerator) generateDataMapperStructType(o ObjectType) {
 func (g *DataMapperGenerator) generateDataMapperCBuilder(o ObjectType) {
 	index := -1
 	for i := range o.ValidatedFields {
-		if o.ValidatedFields[i].name == "id" {
+		if *o.ValidatedFields[i].name == "id" {
 			index = i
 		}
 	}
@@ -525,7 +592,7 @@ func (g *DataMapperGenerator) generateDataMapperCBuilder(o ObjectType) {
 	idField := o.ValidatedFields[index]
 	g.wln(fmt.Sprintf(
 		`func New%sDataMapper(pool *pgxpool.Pool,loadedMap map[%s]%s.DomainObject[%s],) (%sDataMapper, error) {`,
-		o.Name, idField.dataType, dataMapperPkg, idField.dataType, o.Name,
+		o.Name, *idField.dataType, dataMapperPkg, *idField.dataType, o.Name,
 	))
 	g.wln(fmt.Sprintf(
 		"return %sDataMapper{",
@@ -533,7 +600,7 @@ func (g *DataMapperGenerator) generateDataMapperCBuilder(o ObjectType) {
 	))
 	g.wln(fmt.Sprintf(
 		"PostgreSQLDataMapper: %s.PostgreSQLDataMapper[%s.DomainObject[%s],%s]{",
-		dataMapperPkg, dataMapperPkg, idField.dataType, idField.dataType,
+		dataMapperPkg, dataMapperPkg, *idField.dataType, *idField.dataType,
 	))
 	g.wln("Db: pool,")
 	g.wln("LoadedMap: loadedMap,")
@@ -551,12 +618,10 @@ func (g *DataMapperGenerator) generateDataMapperCBuilder(o ObjectType) {
 
 func (g *DataMapperGenerator) generateDoUpdateFn(o ObjectType) {
 	index := -1
-	getters := make([]string, 0)
 	for i := range o.ValidatedFields {
-		if o.ValidatedFields[i].name == "id" {
+		if *o.ValidatedFields[i].name == "id" {
 			index = i
 		}
-		getters = append(getters, o.ValidatedFields[i].getterName)
 	}
 	if index < 0 {
 		panic(fmt.Errorf("could not find id field in the validated fields"))
@@ -564,14 +629,17 @@ func (g *DataMapperGenerator) generateDoUpdateFn(o ObjectType) {
 	idField := o.ValidatedFields[index]
 	g.wln(fmt.Sprintf(
 		"DoUpdate: func(obj %s.DomainObject[%s], stmt *%s.PreparedStatement) error {",
-		dataMapperPkg, idField.dataType, dataMapperPkg,
+		dataMapperPkg, *idField.dataType, dataMapperPkg,
 	))
 	g.wln(fmt.Sprintf(
 		"subject, ok := obj.(*%s.%s)", o.Pkg, o.Name,
 	))
 	g.wln("if !ok { return fmt.Errorf(\"wrong type assertion\")}")
-	for i := range getters {
-		g.wln(fmt.Sprintf("stmt.Append(subject.%s())", getters[i]))
+	g.wln("stmt.Append(subject.Id())")
+	for i := range o.ValidatedFields {
+		if o.ValidatedFields[i].update {
+			g.wln(fmt.Sprintf("stmt.Append(subject.%s())", *o.ValidatedFields[i].getterName))
+		}
 	}
 	g.wln("return nil },")
 }
@@ -580,10 +648,10 @@ func (g *DataMapperGenerator) generateDoInsertFn(o ObjectType) {
 	index := -1
 	getters := make([]string, 0)
 	for i := range o.ValidatedFields {
-		if o.ValidatedFields[i].name == "id" {
+		if *o.ValidatedFields[i].name == "id" {
 			index = i
 		}
-		getters = append(getters, o.ValidatedFields[i].getterName)
+		getters = append(getters, *o.ValidatedFields[i].getterName)
 	}
 	if index < 0 {
 		panic(fmt.Errorf("could not find id field in the validated fields"))
@@ -591,7 +659,7 @@ func (g *DataMapperGenerator) generateDoInsertFn(o ObjectType) {
 	idField := o.ValidatedFields[index]
 	g.wln(fmt.Sprintf(
 		"DoInsert: func(obj %s.DomainObject[%s], stmt *%s.PreparedStatement) error {",
-		dataMapperPkg, idField.dataType, dataMapperPkg,
+		dataMapperPkg, *idField.dataType, dataMapperPkg,
 	))
 	g.wln(fmt.Sprintf(
 		"subject, ok := obj.(*%s.%s)",
@@ -608,10 +676,10 @@ func (g *DataMapperGenerator) generateDoLoadFn(o ObjectType) {
 	index := -1
 	variables := make(map[string]string, 0)
 	for i := range o.ValidatedFields {
-		if o.ValidatedFields[i].name == "id" {
+		if *o.ValidatedFields[i].name == "id" {
 			index = i
 		}
-		variables[o.ValidatedFields[i].name] = o.ValidatedFields[i].dataType
+		variables[*o.ValidatedFields[i].name] = *o.ValidatedFields[i].dataType
 	}
 	if index < 0 {
 		panic(fmt.Errorf("could not find id field in the validated fields"))
@@ -619,7 +687,7 @@ func (g *DataMapperGenerator) generateDoLoadFn(o ObjectType) {
 	idField := o.ValidatedFields[index]
 	g.wln(fmt.Sprintf(
 		"DoLoad: func (resultSet pgx.Rows) (%s.DomainObject[%s],error){",
-		dataMapperPkg, idField.dataType,
+		dataMapperPkg, *idField.dataType,
 	))
 	g.wln("var (")
 	for k, v := range variables {
@@ -698,7 +766,7 @@ func (g *DataMapperGenerator) generateTestInsertFunc(o ObjectType) {
 		o.Pkg, o.Builder,
 	))
 	for _, v := range o.ValidatedFields {
-		g.wln(fmt.Sprintf("v.%s,", v.getterName))
+		g.wln(fmt.Sprintf("v.%s,", *v.getterName))
 	}
 	g.wln(")")
 	g.wln("id, err := dataMapper.Insert(ctx, aggregate)")
@@ -726,13 +794,59 @@ func (g *DataMapperGenerator) generateTestFindFunc(o ObjectType) {
 			`if aggregate.%s() != v.%s {
 		t.Fatal(AssertionError{name: "%s", expected:v.%s, found:aggregate.%s()}.Error())
 			}`,
-			v.getterName, v.getterName, v.name, v.getterName, v.getterName,
+			*v.getterName, *v.getterName, *v.name, *v.getterName, *v.getterName,
 		))
 	}
 	g.wln("}})")
 }
 
-func (g *DataMapperGenerator) generateTestRemoveFunc(o ObjectType) {
+func (g *DataMapperGenerator) generateTestUpdateFunc(o ObjectType) {
+	g.wln("t.Run(\"Update\", func(t *testing.T) {")
+	g.wln("for _,v := range testData {")
+	g.wln("dbAggregate, err := dataMapper.Find(ctx, v.Id)")
+	g.wln("if err != nil { t.Fatal(err) }")
+	g.wln(fmt.Sprintf(
+		"aggregate, ok := dbAggregate.(*%s.%s)",
+		o.Pkg, o.Name,
+	))
+	g.wln("if !ok { t.Fatalf(\"wrong type assertion \")")
+	g.wln("for _, v1 := range testUpdateData {")
+	for _, v := range o.ValidatedFields {
+		if v.update {
+			g.wln(fmt.Sprintf(
+				"aggregate.%s(v1.%s)",
+				*v.setterName, *v.getterName,
+			))
+		}
+	}
+	g.wln("}")
+	g.wln("err = dataMapper.Update(ctx, aggregate)")
+	g.wln("if err != nil { t.Fatal(err) }")
+	g.wln("dbAggregate, err = dataMapper.Find(ctx, v.Id)")
+	g.wln("if err != nil { t.Fatal(err) }")
+	g.wln(fmt.Sprintf("aggregate, ok := dbAggregate.(*%s.%s)",
+		o.Pkg, o.Name,
+	))
+	g.wln("if !ok { t.Fatalf(\"wrong type assertion \")")
+	g.wln("for _, v1 := range testUpdateData {")
+	for _, v := range o.ValidatedFields {
+		if v.update {
+			g.wln(fmt.Sprintf(
+				"if aggregate.%s() != v1.%s {",
+				*v.getterName, *v.getterName,
+			))
+			g.wln(fmt.Sprintf(
+				"t.Fatal(AssertionError{name: \"%s\", expected:v.%s, found:aggregate.%s()}.Error())",
+				*v.name, *v.getterName, *v.getterName,
+			))
+			g.wln("}")
+		}
+	}
+	g.wln("}")
+	g.wln("}}}})")
+}
+
+func (g *DataMapperGenerator) generateTestRemoveFunc() {
 	g.wln("t.Run(\"Remove\", func(t *testing.T) {")
 	g.wln("for _,v := range testData {")
 	g.wln("err := dataMapper.Remove(ctx, v.Id)")
@@ -744,10 +858,10 @@ func (g *DataMapperGenerator) generateTestFn(o ObjectType) {
 	index := -1
 	variables := make(map[string]string, 0)
 	for i := range o.ValidatedFields {
-		if o.ValidatedFields[i].name == "id" {
+		if *o.ValidatedFields[i].name == "id" {
 			index = i
 		}
-		variables[o.ValidatedFields[i].name] = o.ValidatedFields[i].dataType
+		variables[*o.ValidatedFields[i].name] = *o.ValidatedFields[i].dataType
 	}
 	if index < 0 {
 		panic(fmt.Errorf("could not find id field in the validated fields"))
@@ -762,7 +876,7 @@ func (g *DataMapperGenerator) generateTestFn(o ObjectType) {
 	g.wln("if err != nil { t.Fatal(err) }")
 	g.wln(fmt.Sprintf(
 		"loadedMap := make(map[%s]%s.DomainObject[%s],0)",
-		idField.dataType, dataMapperPkg, idField.dataType,
+		*idField.dataType, dataMapperPkg, *idField.dataType,
 	))
 	g.wln(fmt.Sprintf(
 		"dataMapper, err := %s.New%sDataMapper(pool, loadedMap)",
@@ -771,20 +885,21 @@ func (g *DataMapperGenerator) generateTestFn(o ObjectType) {
 	g.wln("if err != nil { t.Fatal(err) }")
 	g.generateTestInsertFunc(o)
 	g.generateTestFindFunc(o)
-	g.generateTestRemoveFunc(o)
+	g.generateTestUpdateFunc(o)
+	g.generateTestRemoveFunc()
 	g.wln("}")
 }
 
 func (g *DataMapperGenerator) generateTestData(o ObjectType) {
 	g.wln("var testData = map[string] struct{")
 	for _, v := range o.ValidatedFields {
-		g.wln(fmt.Sprintf("%s %s", v.getterName, v.dataType))
+		g.wln(fmt.Sprintf("%s %s", *v.getterName, *v.dataType))
 	}
 	g.wln("}{")
 	g.wln("\"valid\": {")
 	for _, v := range o.ValidatedFields {
 		var randomValue any
-		switch v.dataType {
+		switch *v.dataType {
 		case "string":
 			randomValue = fmt.Sprintf("\"%s\"", randStringBytesMaskImprSrcUnsafe(10))
 		case "int":
@@ -792,10 +907,36 @@ func (g *DataMapperGenerator) generateTestData(o ObjectType) {
 		}
 		g.wln(fmt.Sprintf(
 			"%s: %v,",
-			v.getterName, randomValue,
+			*v.getterName, randomValue,
 		))
 	}
 	g.wln("},}")
+
+	g.wln("var testUpdateData = map[string] struct{")
+	for _, v := range o.ValidatedFields {
+		if v.update {
+			g.wln(fmt.Sprintf("%s %s", *v.getterName, *v.dataType))
+		}
+	}
+	g.wln("}{")
+	g.wln("\"valid\": {")
+	for _, v := range o.ValidatedFields {
+		if v.update {
+			var randomValue any
+			switch *v.dataType {
+			case "string":
+				randomValue = fmt.Sprintf("\"%s\"", randStringBytesMaskImprSrcUnsafe(10))
+			case "int":
+				randomValue = randInt()
+			}
+			g.wln(fmt.Sprintf(
+				"%s: %v,",
+				*v.getterName, randomValue,
+			))
+		}
+	}
+	g.wln("},}")
+
 }
 
 func (g *DataMapperGenerator) GenerateAllTests() error {
