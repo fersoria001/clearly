@@ -18,5 +18,12 @@
       "dir": "/example",
       "builder": "NewDomainAggregate"
     }
-  ]
+  ],
+  "tests": {
+    "db": {
+      "pkg": "example",
+      "dir": "/example",
+      "builder": "CreatePool"
+    }
+  }
 }

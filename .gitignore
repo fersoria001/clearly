@@ -2,7 +2,6 @@
 # https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
 #
 # Binaries for programs and plugins
-*.exe
 *.exe~
 *.dll
 *.so
@@ -26,10 +25,11 @@ go.work.sum
 
 # generated
 generated
-
-# main
-main.go
+generated_tests
 
 # misc
 notes.md
 wc.md
+
+# not included yet
+data_mapper/virtual_slice_loader.go

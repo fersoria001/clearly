@@ -1,5 +1,7 @@
 package example
 
+import "github.com/google/uuid"
+
 type DomainAggregate struct {
 	id   string
 	name string
@@ -26,13 +28,13 @@ func (a DomainAggregate) Name() string {
 	return a.name
 }
 
-// type DomainValueObject struct {
-// 	id    string
-// 	value int
-// }
+type DomainValueObject struct {
+	id    string
+	value int
+}
 
-// type DomainEntity struct {
-// 	id          uuid.UUID
-// 	name        string
-// 	valueObject *DomainValueObject
-// }
+type DomainEntity struct {
+	id          uuid.UUID
+	name        string
+	valueObject *DomainValueObject
+}
