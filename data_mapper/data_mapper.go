@@ -1,9 +1,11 @@
 package data_mapper
 
 import (
+	"clearly-not-a-secret-project/interfaces"
 	"context"
 	"fmt"
 	"reflect"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -14,15 +16,7 @@ type StatementSource interface {
 	Parameters() []interface{}
 }
 
-type Recognizable[K any] interface {
-	Id() K
-}
-
-type Comparable interface {
-	Equals(obj Comparable) bool
-}
-
-type DataMapper[T Recognizable[K], K comparable] interface {
+type DataMapper[T interfaces.DomainObject[K], K comparable] interface {
 	Insert(ctx context.Context, obj T) (K, error)
 	Update(ctx context.Context, obj T) error
 	Remove(ctx context.Context, id K) error
@@ -31,7 +25,8 @@ type DataMapper[T Recognizable[K], K comparable] interface {
 	getId(rows pgx.Rows) (K, error)
 	load(resultSet pgx.Rows) (T, error)
 	loadAll(resultSet pgx.Rows) ([]T, error)
-	//registries.Registrable
+	interfaces.LazyLoading[T, K]
+	interfaces.Registrable
 }
 
 type PreparedStatement struct {
@@ -60,12 +55,6 @@ func (q *PreparedStatement) ExecuteQuery(ctx context.Context) (pgx.Rows, error) 
 	return rows, nil
 }
 
-type DomainObject[K comparable] interface {
-	Recognizable[K]
-	//Comparable
-	//Markable
-}
-
 type Markable interface {
 	MarkNew() error
 	MarkClean() error
@@ -73,7 +62,7 @@ type Markable interface {
 	MarkRemoved() error
 }
 
-type PostgreSQLDataMapper[T Recognizable[K], K comparable] struct {
+type PostgreSQLDataMapper[T interfaces.DomainObject[K], K comparable] struct {
 	Db              *pgxpool.Pool
 	LoadedMap       map[K]T
 	FindStatement   string
@@ -84,6 +73,9 @@ type PostgreSQLDataMapper[T Recognizable[K], K comparable] struct {
 	DoInsert        func(obj T, stmt *PreparedStatement) error
 	DoUpdate        func(obj T, stmt *PreparedStatement) error
 	DomainType      reflect.Type
+	LazyLoading     bool
+	CreateGhost     func(id K) T
+	DoLoadLine      func(resultSet pgx.Rows, obj T) error
 }
 
 func (d PostgreSQLDataMapper[T, K]) Type() reflect.Type {
@@ -144,10 +136,60 @@ func (d PostgreSQLDataMapper[T, K]) Remove(ctx context.Context, id K) error {
 	return nil
 }
 
+func (d PostgreSQLDataMapper[T, K]) Load(obj T) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+	if !obj.IsGhost() {
+		return fmt.Errorf("assertion error: the object to load is not a ghost")
+	}
+	stmt := &PreparedStatement{
+		conn:  d.Db,
+		query: d.FindStatement,
+		args:  make([]interface{}, 0),
+	}
+	stmt.Append(obj.Id())
+	rows, err := stmt.ExecuteQuery(ctx)
+	if err != nil {
+		return fmt.Errorf("error at execute query %w", err)
+	}
+	if !rows.Next() {
+		return fmt.Errorf("rows next returned false")
+	}
+	return d.loadLine(rows, obj)
+}
+
+func (d PostgreSQLDataMapper[T, K]) loadLine(resultSet pgx.Rows, obj T) error {
+	if !obj.IsGhost() {
+		return fmt.Errorf("assertion error: the object to load is not a ghost")
+	}
+	err := obj.MarkLoading()
+	if err != nil {
+		return err
+	}
+	err = d.DoLoadLine(resultSet, obj)
+	if err != nil {
+		return err
+	}
+	err = obj.MarkLoaded()
+	if err != nil {
+		return err
+	}
+	if resultSet.Err() != nil {
+		return err
+	}
+	resultSet.Close()
+	return nil
+}
+
 func (d PostgreSQLDataMapper[T, K]) Find(ctx context.Context, id K) (T, error) {
 	var nilT T
 	if obj, ok := d.LoadedMap[id]; ok {
 		return obj, nil
+	}
+	if d.LazyLoading && d.CreateGhost != nil {
+		result := d.CreateGhost(id)
+		d.LoadedMap[id] = result
+		return result, nil
 	}
 	stmt := &PreparedStatement{
 		conn:  d.Db,
@@ -159,7 +201,9 @@ func (d PostgreSQLDataMapper[T, K]) Find(ctx context.Context, id K) (T, error) {
 	if err != nil {
 		return nilT, fmt.Errorf("error at execute query %w", err)
 	}
-	rows.Next()
+	if !rows.Next() {
+		return nilT, fmt.Errorf("rows next returned false")
+	}
 	return d.load(rows)
 }
 
