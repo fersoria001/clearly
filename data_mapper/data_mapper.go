@@ -48,11 +48,7 @@ func (q *PreparedStatement) Execute(ctx context.Context) (int64, error) {
 }
 
 func (q *PreparedStatement) ExecuteQuery(ctx context.Context) (pgx.Rows, error) {
-	rows, err := q.conn.Query(ctx, q.query, q.args...)
-	if err != nil {
-		return nil, err
-	}
-	return rows, nil
+	return q.conn.Query(ctx, q.query, q.args...)
 }
 
 type Markable interface {

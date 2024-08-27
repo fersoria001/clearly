@@ -16,16 +16,17 @@
           "update": true
         }
       ],
-      "pkg": "example",
-      "dir": "/example",
-      "builder": "NewDomainAggregate"
+      "lazy": true,
+      "builder": "NewDomainAggregate",
+      "pkg": "example_subdomain",
+      "dir": "example/example_models/example_subdomain"
     }
   ],
-  "tests": {
-    "db": {
-      "pkg": "example",
-      "dir": "/example",
-      "builder": "CreatePool"
-    }
+  "rootDir": "example/example_models",
+  "rootPkg": "example_models",
+  "db": {
+    "pkg": "example_conn",
+    "dir": "example/example_conn",
+    "builder": "CreatePool"
   }
 }

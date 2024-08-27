@@ -26,10 +26,14 @@ go.work.sum
 # generated
 generated
 generated_tests
+generated_registry
+example/example_models/generated.datasource.go
+example/example_models/example_subdomain/domain_aggregate.generated.go
 
 # misc
 notes.md
 wc.md
 
-# not included yet
-data_mapper/virtual_slice_loader.go
+# mock
+domain
+infrastructure
